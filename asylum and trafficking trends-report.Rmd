@@ -875,21 +875,6 @@ dbDisconnect(db)
 rm(db)
 ```
 
-```{bash, eval=FALSE}
-
-#setting directory to desired folder
-cd /Users/annportlock/Documents/Data for Data Scientists/my472-at24-final-Ann-Sc
-
-#adding files
-git add .
-
-#committing
-git commit -m "adding report, data, & outputs"
-
-#pushing to GitHub
-git push
-```
-
 \-
 
 \-
