@@ -1,0 +1,908 @@
+---
+title: "Nationality as a Risk Indicator for Modern Slavery in the UK"
+author: "Ann Scruggs"
+date: "1 July 2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Introduction
+
+A 2022 UNHCR and British Red Cross [report](https://www.redcross.org.uk/about-us/what-we-do/we-speak-up-for-change/at-risk-exploitation-and-the-uk-asylum-system#:~:text=redcross.org.uk-,Key%20findings,risks%20of%20destitution%20and%20homelessness.) highlighted that UK asylum-seekers face high risks of exploitation that might be mitigated through vulnerability screening. Nationality is one possible indicator of increased risk.
+
+This report introduces a preliminary dataset built from publicly available data. It combines UK asylum statistics with National Referral Mechanism (NRM) data on individuals referred as potential victims of modern slavery, organized by nationality and quarter. The dataset is normalized and structured to make it easy to explore trends, ask questions, and illustrate how nationality might relate to vulnerability.
+
+The aim here is not a full analysis, but a demonstration of how a tailored dataset can highlight possible patterns and provide a foundation for deeper research. Code is provided in the appendix.
+
+| Data Sources:
+| [Immigration system statistics](https://www.gov.uk/government/statistical-data-sets/immigration-system-statistics-data-tables) – quarterly counts of asylum-seekers by nationality
+| [National Referral Mechanism (NRM)](https://www.gov.uk/government/collections/national-referral-mechanism-statistics) – quarterly counts of individuals referred as potential victims of modern slavery, by nationality
+
+## Dataset: Asylum Seeker and Slavery Victim Referrals
+
+The new dataset presented below merges asylum-seeker counts with NRM referrals by nationality over time, enabling comparative analysis of nationalities seeking asylum and those potentially at risk of modern slavery in the UK.
+
+```{r packages}
+
+#Loading relevent packages for report
+suppressMessages(library(tidyverse))
+suppressMessages(library(readr))
+suppressMessages(library(readxl)) 
+suppressMessages(library(dplyr))
+suppressMessages(library(RSelenium))
+suppressMessages(library(rvest))
+suppressMessages(library(readODS))
+suppressMessages(library(ggplot2))
+suppressMessages(library(scales))
+suppressMessages(library(patchwork))
+suppressMessages(library(DBI))
+suppressMessages(library(bigrquery))
+suppressMessages(library(janitor))
+```
+
+```{r directory}
+
+#setting local directory (update this to relevant location on your computer)
+ddir <- "~/Documents/LSE/Dissertation/My report"
+
+#checking if the directory exists, and if not, creating it
+if(dir.exists(ddir)){ 
+  invisible(NULL) #preventing default NULL message if it exists
+  } else { dir.create(ddir) }
+```
+
+```{r downloader}
+
+#making a function to download data through a URL
+downloader <- function(link) {
+  
+  #setting download URL 
+  url <- link
+
+  #creating path for the file 
+  path <- url %>%  #starting with url
+    str_extract("/([^/]+)$") %>%  #extracting file name
+    paste0(ddir, "/", .) #pasting to ddir with correct structure
+
+  #checking if already downloaded, and if not, downloading to path
+  if(file.exists(path)) { } else {
+    download.file(url, path)
+  }
+  
+  #returning the path so its possible to retrieve 
+  return(path)
+}
+```
+
+```{r loadingPrimary}
+
+#Run asylum_data through downloader().
+
+#defining url
+asylum_by_nat_url <- "https://assets.publishing.service.gov.uk/media/6748453624108edc3c8ceb3a/asylum-seekers-receipt-support-datasets-sep-24.xlsx"
+
+#downloading using function created earlier 
+local_file <- downloader(asylum_by_nat_url)
+ 
+#reading in the data & suppressing message regarding column names (these will be addressed later)
+raw_asylum_data <- suppressMessages(read_excel(local_file, #specificying file path 
+                           sheet = "Data_Asy_D09")) #specifying sheet to read in
+```
+
+```{r retrieveNRM, eval=FALSE}
+#########################################################################
+#download raw data from BigQuery and skip to "Normalising Data" portion 
+#########################################################################
+
+#connecting to database
+db <- dbConnect(
+  bigrquery::bigquery(), 
+  project = "asylum-modernslavery", #assigning created project name
+  dataset = "asylum_referral_data", #assigning created dataset name
+  billing = "asylum-modernslavery" #assigning project name in lieu of billing
+)
+
+#loading in the NRM secondary data
+untidy_full_nrm_data <- dbGetQuery(db, "SELECT * FROM untidy_full_nrm_data")
+```
+
+```{r nrmPage}
+
+#########################################################################
+# Read in the webpage and scrape to find each page title.
+#########################################################################
+
+#setting URL for base webpage 
+url <- "https://www.gov.uk/government/collections/national-referral-mechanism-statistics" 
+
+#reading in url
+html <- read_html(url)
+
+#scraping to find just page titles using css selector
+titles_element <- html_elements(html, 
+                                css = ".gem-c-document-list__item-title .gem-c-force-print-link-styles")
+
+#extracting just the text and defining
+page_titles <- html_text(titles_element)
+```
+
+```{r titleFunction}
+
+#creating function to return only quarterly titles based on year
+get_titles <- function(year) {  #setting argument to year
+    
+  #returning titles that have the relevant year and do not contain the word "summary"
+  return(page_titles[grepl(as.character(year), page_titles) & 
+                       !grepl("summary", page_titles)])
+}
+
+```
+
+```{r setVectors}
+
+#setting vector with desired years of data
+desired_data <- c(2023,2024,2025) #edit this if desired
+
+#initializing an empty vector to store the results
+all_titles_vector <- character()
+```
+
+```{r titles}
+
+#looping through each year and collecting titles 
+for (year in desired_data) { #setting loop to iterate over vector with years
+  
+  titles_for_year <- get_titles(year)  #running year through get_titles function
+  
+  all_titles_vector <- c(all_titles_vector, titles_for_year)  #appending the results to the vector
+}
+```
+
+```{r RSelenium, eval=FALSE}
+
+#########################################################################
+#Initialize a Selenium server and navigate to NRM Statistics webpage.
+#########################################################################
+
+#starting Selenium server
+rD <- rsDriver(
+  browser = "firefox",
+  geckover = "latest",       # ensures correct GeckoDriver
+  phantomver = NULL,          # disables PhantomJS download
+  verbose = FALSE,
+  port = netstat::free_port(random = TRUE)
+)
+
+#setting driver
+driver <- rD$client 
+
+#navigating to set URL 
+driver$navigate(url)
+
+#delaying 
+Sys.sleep(7)
+
+#finding accept button with relevant xpath
+accept_button <- driver$findElement(using = "xpath", 
+                                    value = "//button[text() = 'Accept additional cookies']")
+
+#uncomment this line to use the reject_buttom
+#reject_button <- driver$findElement(using = "xpath", value = "//button[text() = 'Reject additional cookies']")
+
+#delaying
+Sys.sleep(3)
+
+#clicking accept_button
+accept_button$clickElement()
+
+#delaying
+Sys.sleep(4)
+```
+
+```{r seleniumLoop, eval=FALSE}
+
+#########################################################################
+#Iterate over each gathered page title. The loop navigates to each webpage and extracts the relevant datatable’s url.
+#########################################################################
+
+#initializing empty vector to store results
+all_links <- character()
+
+#starting for loop 
+for (i in all_titles_vector) { #setting to iterate over each title obtained
+
+  #using title to create xpath that leads to page link 
+  path <- paste0("//a[text() = ","'",i,"'","]")
+  
+  #finding page link with path created
+  next_page <- driver$findElement(using = "xpath", value = path)
+  
+  #delaying
+  Sys.sleep(6)
+  
+  #scrolling down to page link (found that element would not click if not in view) 
+  scroll <- driver$executeScript("arguments[0].scrollIntoView(true);", list(next_page))
+  
+  #delaying
+  Sys.sleep(2)
+  
+  #clicking page element
+  next_page$clickElement()
+  
+  #delaying
+  Sys.sleep(15)
+
+  #finding the element with an xpath for the first .ods link
+  link_element <- driver$findElement(using = "xpath", value = "//a[contains(@href, '.ods')][1]")
+
+  #delaying
+  Sys.sleep(5)
+  
+  #extracting the href attribute (download url)
+  ods_link <- link_element$getElementAttribute("href")[[1]]
+
+  #delaying
+  Sys.sleep(5.5)
+  
+  #adding download url to all_links
+  all_links <- c(all_links, ods_link)
+
+  #navigating back to previous page before next iteration
+  driver$goBack()
+  
+  #delaying
+  Sys.sleep(25)
+}
+
+#ending Selenium session
+driver$close()
+rD$server$stop()
+```
+
+```{r nrmDownloader, eval=FALSE}
+
+#running all links through the downloader function
+for (i in all_links) {
+  downloader(i)
+}
+```
+
+```{r filePaths}
+#finding file path names as saved in local ddir
+file_paths <- list.files(ddir, full.names = TRUE)
+
+#filtering for only files containing "referral" in the names
+nrm_file_paths <- grep("referral", file_paths, value = TRUE, ignore.case = TRUE)
+
+#setting vector of sheet names to read in - in order over nrm_file_paths
+sheet_name <- c("Table_5","Table_7","Table_7","Table_5","Table_7","Table_7","Table_5", "Table_7", "Table_5", "Table_7")
+```
+
+```{r nrmFunction}
+
+#creating cleaning function
+nrm_read_clean <- function(nrm_file_paths, sheet_name) { #setting arguments
+  
+  #reading in the data & suppressing message regarding column names (these will be addressed later)
+  nrm <- suppressMessages(read_ods(nrm_file_paths, #specificying file path 
+                       sheet = sheet_name)) #specifying sheet to read in
+
+  #locating position of "Total" sections where the relevant data is
+  total_row <- which(nrm[, 1] == "Total")
+
+  #subsetting to select only the rows below this "Total" category and removing the first column 
+  subset_nrm <- nrm[(total_row + 1):nrow(nrm),-1 ]
+  
+  #selecting only the first and last column 
+  subset_nrm <- subset_nrm[, c(1, ncol(subset_nrm))]
+  
+  #modifying column names
+  colnames(subset_nrm) <- c("Nationality", "Referral Count")
+  
+  #modifying the Referral Count column as numeric
+  subset_nrm$`Referral Count` <- as.numeric(subset_nrm$`Referral Count`)
+
+  #returning the final dataset
+  return(subset_nrm)
+}
+```
+
+```{r nrmClean}
+
+#initializing an empty list to store results
+nrm_data <- list()
+
+#starting for loop to iterate over each downloaded nrm file
+for (i in seq_along(nrm_file_paths)) { #setting to sequence so files match sheet names
+  
+  #running each nrm file through the nrm_read_clean function with the relevant sheet
+  suppressMessages(nrm_data[[i]] <- nrm_read_clean(nrm_file_paths[i], 
+                                                   sheet = sheet_name[i]))
+}
+```
+
+```{r nrmDates}
+#extracting the relevant quarters from the file paths 
+quarters <- nrm_file_paths %>%
+  str_extract_all("(?<=quarter-)(\\d+)(?=-\\d{4})") 
+
+#extracting the relevant years from the file paths 
+year <- nrm_file_paths %>%
+  str_extract_all("\\d{4}")
+
+#creating function to map quarters to the last day of the quarter
+get_date <- function(quarter, year) {
+  if (quarter == 1) {  
+    return(paste("31-03-", year, sep = "")) #returning last day of quarter 1
+  } else if (quarter == 2) {
+    return(paste("30-06-", year, sep = "")) #returning last day of quarter 2
+  } else if (quarter == 3) {
+    return(paste("30-09-", year, sep = "")) #returning last day of quarter 3
+  } else if (quarter == 4) {
+    return(paste("31-12-", year, sep = "")) #returning last day of quarter 4
+  }
+}
+
+#initializing empty list to store results
+dates <- list()
+
+#setting loop to iterate along the quarters vector in order 
+for (i in seq_along(quarters)) { #sequencing along to maintain order
+  
+  #running get_date function to extract relevant quarter and year info
+  current_date <- get_date(quarters[i],year[i]) 
+  
+  #saving dates
+  dates <- c(dates,current_date) 
+}
+```
+
+```{r addDates}
+
+#unlisting dates so it behaves as a regular vector
+dates <- unlist(dates)
+
+#initiating an empty list to store our data
+full_nrm_data <- list()
+
+#running a for loop to sequence along each nrm tibble and add a year column 
+for (i in seq_along(nrm_data)) {  #sequencing along 
+  
+  #setting the current date
+  current_date <- dates[i]
+  
+  #adding Date column by mutating 
+  tibble <- nrm_data[[i]] %>%
+    mutate("Date" = (current_date))
+  
+  #appending the result to the combined tibble
+  full_nrm_data <- bind_rows(full_nrm_data, tibble)
+  
+}
+
+#assinging differentiating name to appended data
+untidy_full_nrm_data <- full_nrm_data
+```
+
+```{r isoData}
+##########################################################################
+#The ISO-3166 Dataset is used to normalise nationality to country names between NRM and asylum_data.
+#Run the URL through downloader(). Using the top guess from html_encoding_guess, read the file in.
+##########################################################################
+
+#setting URL for ISO - 3166  
+iso_url <- "https://t2a.io/assets/blog-move/uploads/2014/03/Countries-List.csv"
+
+#running url through the downloader function
+file <- downloader(iso_url)
+
+#guessing encoding
+guess <- html_encoding_guess(file) 
+
+#reading in with top encoding guess
+iso_raw <- suppressMessages(read_csv(file, locale = locale(encoding = "ISO-8859-1")))
+```
+
+```{r primary}
+##########################################################################
+#Tidying Data
+##########################################################################
+
+#replacing headers with the first row
+new_headers <- raw_asylum_data[1, ]  #extracting the first row as headers
+asylum_data <- raw_asylum_data[-1, ]  #removing the first row from the data
+colnames(asylum_data) <- new_headers  #setting the new headers
+
+#renaming Date column 
+asylum_data <- asylum_data %>%
+  rename(Date = `Date (as at…)`) #renaming to "Date"
+
+#formating Date column as date
+asylum_data$Date <- as.Date(asylum_data$Date, format = "%d %b %Y")
+
+#formating People column as integer
+asylum_data$People <- as.numeric(asylum_data$People)
+
+#grouping and summarising for relevant data
+asylum_data <- asylum_data %>%
+  group_by(Date,Nationality) %>% #grouping by Date and Nationality
+  
+  #summarising to get column with sum of people seeking asylum 
+  summarise("Asylum_Seeker_Count" = sum(People), 
+            
+            ### * the following line of code was generated by AI/ChatGPT 
+            .groups = "keep") #keeping all grouping variables
+```
+
+```{r nrmFinal}
+#Tidy the format of the NRM data
+#modifying date format and selecting columns in new order 
+full_nrm_data <- untidy_full_nrm_data %>% 
+  mutate(Date = as.Date(Date, format = "%d-%m-%Y")) %>% #updating format to match asylum date format
+  select(Date,Nationality,`Referral Count`) #selecting columns
+```
+
+```{r dateFilter}
+
+#filtering for dates greater than or equal to the earilest date in full_nrm_data
+asylum_data <- asylum_data %>%
+  filter(Date >= as.Date(min(full_nrm_data$Date))) #using min to find earliest date
+```
+
+```{r isoPrep}
+
+#selecting relevant columns from data 
+iso_data <- iso_raw %>%
+  select(Name,`Demonym 1`,`Demonym 2`,`Demonym 3`) 
+
+#pivoting data longer to include all Demonyms (Nationalities) in one column
+long_iso_data <- iso_data %>%
+  pivot_longer(cols = c(`Demonym 1`,`Demonym 2`,`Demonym 3`), #pivoting Demonym columns
+               names_to = "DemonymNumber",  #setting  names
+               values_to = "Nationality",  #setting name for values column
+               values_drop_na = TRUE) %>% #dropping NAs
+  select("Nationality", Name) %>% #selecting necessary columns 
+  rename("Country" = Name) #renaming for readability
+```
+
+```{r isoClean}
+
+#defining every unique country found in the asylum_data
+countries <- unique(asylum_data$Nationality)
+
+#filtering iso data for any country in asylum data
+asylum_iso <- long_iso_data %>%
+  filter(Country %in% countries)
+
+#filtering full_nrm_data for any nationality located in the asylum_iso
+filtered_nrm <- full_nrm_data %>%
+  filter(Nationality %in% asylum_iso$Nationality)
+
+```
+
+```{r isoJoin}
+
+#performing a left join by Nationality
+nrm_for_asylum <- filtered_nrm %>%
+  left_join(asylum_iso %>%
+              
+              ### * the following line of code was generated by AI/ChatGPT 
+              distinct(Nationality, .keep_all = TRUE),  #ensuring only one mapping per nationality
+            
+            by = "Nationality") %>% #joining by Nationality
+  select(-Nationality) %>% #removing Nationality column
+  rename(Nationality = Country) #Renaming 
+```
+
+```{r finalJoin}
+
+#using a left join to combine the datasets by Date and Nationality
+join <- asylum_data %>%
+  left_join(nrm_for_asylum, by = c("Date", "Nationality")) 
+
+#mutating so any rows with no Referral Counts will show 0 instead of NA
+asylum_referral_data <- join %>%
+  mutate(`Referral Count` = ifelse(is.na(`Referral Count`), 0, `Referral Count`)) %>%
+  arrange(desc(Date)) #arranging by date
+
+#renaming columns
+asylum_referral_data <- asylum_referral_data %>%
+  rename("Referral_Count" = `Referral Count`, "Date_by_Quarter" = Date) #using underscores instead of spaces
+```
+
+```{r tidyData}
+
+library(reactable)
+
+reactable(
+  asylum_referral_data,
+  filterable = TRUE,
+  searchable = TRUE,
+  pagination = TRUE,
+  highlight = TRUE,
+  striped = TRUE,
+  style = list(color = "#1F77B4")  # classic blue
+
+)
+```
+
+```{r transform1}
+#######################################################################
+#adding additional transformations to report
+#######################################################################
+
+#Including "N/A - Subsistence Only (Dec 2023 - Sep 2024)" in the unknown category
+asy_refer_transformed <- asylum_referral_data %>%
+  
+  #setting ifelse statement within mutated column to modify correct cells
+  mutate(Nationality = ifelse(Nationality == "N/A - Subsistence Only (Dec 2023 - Sep 2024)", 
+                                    "Other and unknown", Nationality))
+```
+
+```{r transform2}
+
+#defining a function to calculate total asylum seekers per date
+total_calculator <- function(date, data) {
+  sum(data$Asylum_Seeker_Count[data$Date_by_Quarter == date])
+}
+
+#adding new column for total asylum population for each date
+asy_refer_transformed <- asy_refer_transformed %>%
+  
+  ### * the following line of code was generated by AI/ChatGPT 
+  #sapply uses the total_calculator to calculate total across every specific date
+  mutate(Total_Asylum_Pop_Per_Date = sapply(Date_by_Quarter, total_calculator, data = asy_refer_transformed)) 
+```
+
+```{r transform3}
+#mutating to add percentage column
+asy_refer_transformed <- asy_refer_transformed %>%
+  
+  #finding percentage by dividing asylum seeker count by new population column
+  mutate("Pct_of_Asylum_Pop" = 
+           #multiplying to get percent and rounding to 2 decimals
+           round((Asylum_Seeker_Count / Total_Asylum_Pop_Per_Date)*100,2)) 
+```
+
+```{r transform4}
+#defining a function to calculate total referrals per date
+total_calculator <- function(date, data) {
+  sum(data$Referral_Count[data$Date_by_Quarter == date])
+}
+
+#adding new column for total referrals for each date
+asy_refer_transformed <- asy_refer_transformed %>%
+  
+  ### * the following line of code was generated by AI/ChatGPT 
+  #sapply uses the total_calculator to calculate total across every specific date
+  mutate("Total_Referrals_Per_Date" = sapply(Date_by_Quarter, total_calculator, data = asy_refer_transformed)) 
+```
+
+```{r transform5}
+#mutating to add percentage column
+asy_refer_transformed <- asy_refer_transformed %>%
+  
+  #finding percentage by dividing referral count by new population column
+  mutate("Pct_of_Total_Referrals" = 
+           #multiplying to get percent and rounding to 2 decimals
+           round((Referral_Count / Total_Referrals_Per_Date) * 100, 2))
+```
+
+```{r transformedData}
+#selecting columns in more readable way
+asylum_referral_transform <- asy_refer_transformed %>%
+  select(Date_by_Quarter,Nationality,
+         Asylum_Seeker_Count,Pct_of_Asylum_Pop,
+         Referral_Count,Pct_of_Total_Referrals,
+         Total_Asylum_Pop_Per_Date,Total_Referrals_Per_Date)
+```
+
+Below is the dataset again, now enhanced with additional insights. The underlying dataset remains the same, but the following transformations have been applied to provide more context and comparative metrics:
+
+-   `Total_Asylum_Pop_Per_Date` - total asylum-seeker population per date
+-   `Pct_of_Asylum_Pop` - each row’s Asylum_Seeker_Count as a proportion of the total asylum population on that date.
+-   `Total_Referrals_Per_Date` - total victim referrals per date
+-   `Pct_of_Total_Referrals` – each row’s Referral_Count as a proportion of the total referrals on that date.
+
+```{r}
+
+reactable(
+  asylum_referral_transform,
+  filterable = TRUE,
+  searchable = TRUE,
+  pagination = TRUE,
+  highlight = TRUE,
+  striped = TRUE,
+  style = list(color = "#1F77B4")  # classic blue
+
+)
+```
+
+# **Initial Visual Insights**
+
+## Who is most at risk?
+
+#### Depicted here are the top 10 nationalities of potential victims of modern slavery since 2023 in the UK.
+
+```{r}
+
+#grouping and summarising data to show total referrals and asylum seekers by Country of origin
+data_by_nationality <- asy_refer_transformed %>%
+  group_by(Nationality) %>% #grouping by nationality
+  summarise("Total_Referral" = sum(Referral_Count), #summing referral count
+            "Total_Asylum" = sum(Asylum_Seeker_Count)) #summing asylum seeker count
+
+#arranging and slicing to get top 10 most referred
+data_by_nat_slice <- data_by_nationality %>%
+  arrange(desc(Total_Referral)) %>%
+  slice_head(n=10) #slicing off the top 10 
+
+#vector of just 10 countries
+top_nations_referred <- data_by_nat_slice$Nationality
+
+#pivoting longer to put counts in same column
+longer_data <- asy_refer_transformed %>%
+  pivot_longer(cols = c(Asylum_Seeker_Count, Referral_Count),
+               names_to = "Count_Type",
+               values_to = "Quantity") 
+
+#plotting 
+top10_victim_plot <- data_by_nat_slice %>% 
+  
+  #setting x argument to Country but ordered by count not alphabet
+  ggplot(aes(x = reorder(Nationality, Total_Referral, decreasing = TRUE), 
+             y = Total_Referral)) + #coloring by Count_Type
+  geom_bar(stat = "identity", position = "dodge",  width = 0.8, fill = "steelblue") + #setting format
+  
+  #customizing titles and labels
+  labs(y = "Quantity",  
+       x = "Nationality", 
+       title = "Top Nationalities of Modern Slavery Victims in the UK (2023–present)") +
+  theme_minimal() + #setting theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  #setting labels diagonally for readability
+  
+top10_victim_plot
+```
+
+```{r}
+#plotting top 10 for only 2025
+top10_plot_2025 <- asy_refer_transformed %>% 
+  
+  filter(year(Date_by_Quarter) == 2025) %>%
+  group_by(Nationality) %>% 
+  summarise(Total_Referral = sum(Referral_Count, na.rm = TRUE)) %>% 
+  slice_max(order_by = Total_Referral, n = 10) %>%
+  
+  
+  #setting x argument to Country but ordered by count not alphabet
+  ggplot(aes(x = reorder(Nationality, Total_Referral , decreasing = TRUE), 
+             y = Total_Referral)) + 
+  geom_bar(stat = "identity", position = "dodge",  width = 0.8, fill = "steelblue") + #setting format
+  
+  #customizing titles and labels
+  labs(y = "Quantity",  
+       x = "Nationality", 
+       title = "Top Nationalities of Modern Slavery Victims in the UK (2025)") +
+  theme_minimal() + #setting theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  #setting labels diagonally for readability
+
+```
+
+#### Since 2023, top asylum-seeker nationalities in the UK—Iran, Afghanistan, Eritrea, Albania, and Sudan—are also among the largest groups of potential modern slavery victims.
+
+```{r}
+#plotting top ten nationalities seeking asylum 
+top10_asylum_plot <- data_by_nationality %>% 
+  
+  slice_max(order_by = Total_Asylum, n = 10) %>%
+  
+  #setting x argument to Country but ordered by count not alphabet
+  ggplot(aes(x = reorder(Nationality, Total_Asylum, decreasing = TRUE), 
+             y = Total_Asylum)) + #coloring by Count_Type
+  geom_bar(stat = "identity", position = "dodge",  width = 0.8, fill = "#E67E22") + #setting format
+  
+  #customizing titles and labels
+  labs(y = "Quantity",  
+       x = "Nationality", 
+       title = "Top Nationalities of Asylum Seekers in the UK (2023–present)") +
+  theme_minimal() + #setting theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  #setting labels diagonally for readability
+  
+top10_asylum_plot
+
+```
+
+#### This data enables nationality-specific insights. Illustrated here are the asylum and referral patterns for Albania and Vietnam since 2023.
+
+```{r}
+#focusing in on Albania
+focus_nations <- "Albania"
+
+plot1 <- asy_refer_transformed %>%
+  filter(Nationality %in% focus_nations) %>%
+  group_by(Date_by_Quarter, Nationality) %>%
+  summarise(
+    Asylum_Seekers = sum(Asylum_Seeker_Count, na.rm = TRUE),
+    Modern_Slavery_Victims = sum(Referral_Count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c("Asylum_Seekers", "Modern_Slavery_Victims"),
+               names_to = "Type",
+               values_to = "Count") %>%
+  ggplot(aes(x = Date_by_Quarter, y = Count, color = Type, linetype = Type)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Nationality, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m") +
+  scale_y_log10() +   # 🔑 log-transform
+  labs(
+    title = "Albanian Asylum Seekers vs. Potential Victims of Modern Slavery in the UK",
+    y = "Count (log scale)",
+    x = "Date",
+    color = "Category",
+    linetype = "Category"
+  ) +
+  theme_minimal()
+
+plot1
+```
+
+#### 
+
+```{r}
+#focusing in on vietnam
+focus_nations <- "Vietnam"
+
+plot1 <- asy_refer_transformed %>%
+  filter(Nationality %in% focus_nations) %>%
+  group_by(Date_by_Quarter, Nationality) %>%
+  summarise(
+    Asylum_Seekers = sum(Asylum_Seeker_Count, na.rm = TRUE),
+    Modern_Slavery_Victims = sum(Referral_Count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c("Asylum_Seekers", "Modern_Slavery_Victims"),
+               names_to = "Type",
+               values_to = "Count") %>%
+  ggplot(aes(x = Date_by_Quarter, y = Count, color = Type, linetype = Type)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Nationality, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m") +
+  scale_y_log10() +   # 🔑 log-transform
+  labs(
+    title = "Vietnamese Asylum Seekers vs. Potential Victims of Modern Slavery in the UK",
+    y = "Count (log scale)",
+    x = "Date",
+    color = "Category",
+    linetype = "Category"
+  ) +
+  theme_minimal()
+
+plot1
+```
+
+## Scope
+
+#### The charts above provide just a **small glimpse into the dataset**. They illustrate some patterns and trends, but do not represent a comprehensive analysis. These visualisations are intended to highlight areas of interest and suggest potential directions for further investigation. While this dataset isolates nationality as a potential risk indicator, many additional factors could be explored to deepen the analysis.
+
+```{r odir, eval=FALSE}
+
+#setting local directory for outputs
+odir <- "~/Documents/LSE/Dissertation/Asylum_ModernSlavery" 
+
+#checking if the directory exists, and if not, creating it
+if(dir.exists(odir)){ } else { dir.create(odir) }
+```
+
+```{r csvSave, eval=FALSE}
+#creating function to check if already downloaded, and if not, downloading to path
+output_saver <- function(data, filename) {
+
+  path <- paste0(odir, "/", filename)
+  
+  if(file.exists(path)) { } else {
+  write.csv(data, path) } 
+}
+    
+#saving tabular data
+output_saver(asylum_referral_data, "asylum_referral_data.csv")
+
+#saving transformed data
+output_saver(asy_refer_transformed, "asylum_referral_transform.csv")
+```
+
+```{r database, eval=FALSE}
+
+#identifying project name (project ID)
+project_name <- "asylum-modernslavery"
+
+#identifiying billing (project ID)
+billing_id <- "asylum-modernslavery"
+
+#identifying dataset name (created on website)
+dataset_name <- "asylum_referral_data"
+```
+
+```{r dbConnect, eval=FALSE}
+
+#connecting to remote database using defined variables above
+db <- dbConnect(
+  bigrquery::bigquery(), 
+  project = project_name,
+  dataset = dataset_name,
+  billing = billing_id
+)
+```
+
+```{r dataLoad, eval=FALSE}
+
+###########################################
+#Primary Data
+###########################################
+
+#loading raw_asylum_data to database
+raw_asylum_data <- raw_asylum_data %>% clean_names() #cleaning columns to satsify BigQuery requirments
+dbWriteTable(db, "raw_asylum_data", raw_asylum_data) #loading to db
+
+###########################################
+#Secondary Data
+###########################################
+
+#loading untidy_full_nrm_data to database
+dbWriteTable(db, "untidy_full_nrm_data", untidy_full_nrm_data)
+
+#loading iso_raw data to database
+iso_raw <- iso_raw %>% clean_names() #cleaning columns to satsify BigQuery requirments
+dbWriteTable(db, "raw_iso_data", iso_raw) #loading to db
+
+###########################################
+#New Data
+###########################################
+
+#loading new tabular data to database
+dbWriteTable(db, "final_asylum_referral", asylum_referral_data)
+
+#loading new transformed data to database
+dbWriteTable(db, "transformed_asylum_referral", asylum_referral_transform)
+```
+
+```{r disconnect, eval=FALSE}
+
+#disconnecting database
+dbDisconnect(db)
+rm(db)
+```
+
+```{bash, eval=FALSE}
+
+#setting directory to desired folder
+cd /Users/annportlock/Documents/Data for Data Scientists/my472-at24-final-Ann-Sc
+
+#adding files
+git add .
+
+#committing
+git commit -m "adding report, data, & outputs"
+
+#pushing to GitHub
+git push
+```
+
+\-
+
+\-
+
+\-
+
+\-
+
+\-
+
+## Appendix: All code
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
