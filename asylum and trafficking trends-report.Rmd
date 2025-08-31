@@ -46,7 +46,7 @@ suppressMessages(library(janitor))
 ```{r directory}
 
 #setting local directory (update this to relevant location on your computer)
-ddir <- "~/Documents/LSE/Dissertation/My report"
+ddir <- "~/Documents/LSE/Dissertation/Asylum_ModernSlavery/My report"
 
 #checking if the directory exists, and if not, creating it
 if(dir.exists(ddir)){ 
